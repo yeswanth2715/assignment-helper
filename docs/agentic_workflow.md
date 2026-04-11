@@ -1,12 +1,12 @@
-# Agentic Assignment Workflow
+# Agentic Assignment Co-Pilot Workflow
 
 This repo is organized around a repeatable workflow:
 
 1. Input a Word assignment brief.
 2. Extract the brief into structured text and metadata.
 3. Convert the brief into task sections, rubric signals, and evidence needs.
-4. Build planning artifacts before drafting.
-5. Draft and package the final submission locally, without committing the private deliverable.
+4. Build planning artifacts and an editable draft starter.
+5. Write and package the final submission locally, without committing the private deliverable.
 
 ## Agent Roles
 
@@ -36,9 +36,9 @@ This repo is organized around a repeatable workflow:
 
 ### Drafting Agent
 
-- Writes the answer in markdown first.
+- Produces an editable draft starter in markdown.
 - Uses the scaffold, research plan, and evidence base.
-- Treats the brief as a checklist, not just background context.
+- Treats the brief as a checklist, not as permission to skip human judgement.
 
 ### QA Agent
 
@@ -54,7 +54,19 @@ This repo is organized around a repeatable workflow:
 - `04_research_plan.md`: task-to-evidence matrix.
 - `05_assignment_scaffold.md`: section outline for drafting.
 - `06_execution_checklist.md`: quality gate before submission.
-- `07_artifact_manifest.json`: manifest of generated files.
+- `07_draft_starter.md`: editable markdown starter with placeholders for claims and citations.
+- `08_figure_table_plan.md`: suggested visuals and tables for the assignment.
+- `09_harvard_reference_guide.md`: citation and reference templates.
+- `10_artifact_manifest.json`: manifest of generated files.
+
+## Ethical Boundary
+
+This repo is designed as a co-pilot, not an auto-submit engine.
+
+- It can help structure the work.
+- It can help plan sources, figures, and citations.
+- It cannot guarantee grades.
+- It should not be used to submit unchecked, unverified output as finished academic work.
 
 ## Public Repo Boundary
 

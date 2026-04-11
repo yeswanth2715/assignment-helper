@@ -294,6 +294,8 @@ def recommend_sources(section_title: str) -> str:
 
 def recommend_artifact(section_title: str) -> str:
     lowered = section_title.lower()
+    if "csr" in lowered:
+        return "CSR initiative-to-theory mapping table or evidence matrix."
     if "esg" in lowered:
         return "Benchmark table plus one materiality or comparison visual."
     if "ethical" in lowered:
@@ -517,6 +519,280 @@ def build_execution_checklist(summary: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def build_draft_starter(summary: dict[str, object]) -> str:
+    assessment_type = str(summary["assessment_type"]).lower()
+    include_exec_summary = "report" in assessment_type
+
+    lines = [
+        f"# Draft Starter: {summary['title']}",
+        "",
+        "> This file is an editable starter, not a submission-ready assignment.",
+        "> Replace every placeholder with your own verified analysis, evidence, and citations.",
+        "",
+        f"**Module:** {summary['module'] or '[Fill module]'}",
+        "",
+        f"**Assessment type:** {summary['assessment_type']}",
+        "",
+        "**Student name:** [Add your name]",
+        "",
+        "**Student ID:** [Add your student ID]",
+        "",
+        "## Working Thesis",
+        "",
+        "- [Write the central judgement you want the assignment to defend.]",
+        "",
+    ]
+
+    if include_exec_summary:
+        lines.extend(
+            [
+                "## Executive Summary",
+                "",
+                "- [Summarise the argument, strongest evidence, and main recommendation.]",
+                "",
+                "## List of Tables and Figures",
+                "",
+                "- [Add planned tables and visuals after you confirm they help the argument.]",
+                "",
+            ]
+        )
+
+    lines.extend(["## Introduction", "", "- [Frame the brief, scope, and argument. Add at least one verified citation.]", ""])
+
+    for section in summary["task_sections"]:
+        lines.extend(
+            [
+                f"## {section['title']}",
+                "",
+                f"**Brief requirement:** {section['description']}",
+                "",
+                "**Section judgement:**",
+                "",
+                "- [State the main claim you will defend in this section.]",
+                "",
+                "**Theory or framework to apply:**",
+                "",
+                "- [Add the named model, theory, or standard you will use.]",
+                "",
+                "**Evidence to insert:**",
+                "",
+                "- [Source 1: what it proves]",
+                "- [Source 2: what it proves]",
+                "- [Source 3: what it proves]",
+                "",
+                "**Draft paragraph plan:**",
+                "",
+                "- Paragraph 1: [Set context and scope.]",
+                "- Paragraph 2: [Apply theory or framework.]",
+                "- Paragraph 3: [Critically evaluate the evidence.]",
+                "- Paragraph 4: [State implications, comparison, or recommendation.]",
+                "",
+                "**In-text citation slots:**",
+                "",
+                "- [Example placeholder: (Author, Year)]",
+                "- [Verify page numbers, years, and source names before submission.]",
+                "",
+                f"**Planned asset:** {recommend_artifact(section['title'])}",
+                "",
+            ]
+        )
+
+    if any("reflection" in section["title"].lower() for section in summary["task_sections"]):
+        lines.extend(
+            [
+                "## Reflection Close",
+                "",
+                "- [State what changes in your own practice and why.]",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## Conclusion",
+            "",
+            "- [Synthesize the full answer and restate the judgement.]",
+            "",
+            "## Reference List",
+            "",
+            "- [Add only sources you actually used and verified.]",
+            "- [Format them in Harvard style using the guide in `09_harvard_reference_guide.md`.]",
+            "",
+            "## Final Check Before Submission",
+            "",
+            "- [ ] Every citation matches a real source.",
+            "- [ ] Every claim is supported by evidence.",
+            "- [ ] All placeholders have been replaced.",
+            "- [ ] The assignment reflects your own judgement and writing.",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def suggest_assets(summary: dict[str, object]) -> list[dict[str, str]]:
+    suggestions: list[dict[str, str]] = [
+        {
+            "asset": "Table 1. Requirement-to-Argument Map",
+            "use": "Near the introduction or methodology section",
+            "purpose": "Show how each brief task is being answered.",
+            "data": "Task sections, section claims, and planned evidence.",
+        }
+    ]
+
+    for section in summary["task_sections"]:
+        title = section["title"].lower()
+        if "csr" in title:
+            suggestions.append(
+                {
+                    "asset": "Table. CSR initiative-to-theory map",
+                    "use": section["title"],
+                    "purpose": "Link company initiatives to the selected framework clearly.",
+                    "data": "CSR initiatives, chosen theory, alignment points, and critique points.",
+                }
+            )
+        elif "esg" in title:
+            suggestions.append(
+                {
+                    "asset": "Figure. ESG benchmark or materiality visual",
+                    "use": section["title"],
+                    "purpose": "Summarize comparison or materiality logic at a glance.",
+                    "data": "Competitor metrics, ratings, material issues, or trend data.",
+                }
+            )
+            suggestions.append(
+                {
+                    "asset": "Table. ESG comparison matrix",
+                    "use": section["title"],
+                    "purpose": "Compare environment, social, and governance performance clearly.",
+                    "data": "Company KPIs, competitor KPIs, and critical commentary.",
+                }
+            )
+        elif "ethical" in title:
+            suggestions.append(
+                {
+                    "asset": "Table. Ethical issue gap analysis",
+                    "use": section["title"],
+                    "purpose": "Compare current response, evidence of progress, and remaining gaps.",
+                    "data": "Current company actions, stakeholder concerns, and ethical framework criteria.",
+                }
+            )
+        elif "strategy" in title or "solutions" in title or "recommend" in title:
+            suggestions.append(
+                {
+                    "asset": "Table. Action plan",
+                    "use": section["title"],
+                    "purpose": "Translate recommendations into timing, owner, and success measures.",
+                    "data": "Actions, rationale, timing, and metrics.",
+                }
+            )
+        elif "reflection" in title:
+            suggestions.append(
+                {
+                    "asset": "Optional table. Personal hook-to-practice map",
+                    "use": section["title"],
+                    "purpose": "Keep the reflection structured without overexplaining it.",
+                    "data": "Named hook, impact, and counter-practice.",
+                }
+            )
+        else:
+            suggestions.append(
+                {
+                    "asset": "Table. Evidence map",
+                    "use": section["title"],
+                    "purpose": "Keep theory, evidence, and judgement aligned.",
+                    "data": "Claims, sources, frameworks, and critique points.",
+                }
+            )
+
+    return suggestions
+
+
+def build_figure_table_plan(summary: dict[str, object]) -> str:
+    lines = [
+        f"# Figure and Table Plan: {summary['title']}",
+        "",
+        "Use visuals only when they clarify the argument. Every figure or table should do analytical work, not just decorate the paper.",
+        "",
+        "| Planned asset | Where to use it | Purpose | What data you still need |",
+        "| --- | --- | --- | --- |",
+    ]
+
+    for suggestion in suggest_assets(summary):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    markdown_escape(suggestion["asset"]),
+                    markdown_escape(suggestion["use"]),
+                    markdown_escape(suggestion["purpose"]),
+                    markdown_escape(suggestion["data"]),
+                ]
+            )
+            + " |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Caption Checklist",
+            "",
+            "- Give each figure and table a descriptive title.",
+            "- Add a source line under every non-original asset.",
+            "- If you created the visual yourself, still note the underlying data source.",
+            "- Make sure the text explicitly refers to each asset and explains why it matters.",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def build_harvard_reference_guide() -> str:
+    lines = [
+        "# Harvard Reference and In-Text Citation Guide",
+        "",
+        "Use this file as a formatting aide only. Verify every source against the original publication before submitting.",
+        "",
+        "## In-Text Citation Patterns",
+        "",
+        "- Narrative: `Author (Year) argues that ...`",
+        "- Parenthetical: `... (Author, Year).`",
+        "- Two authors: `(Author and Author, Year)`",
+        "- Three or more authors: `(Author et al., Year)`",
+        "- Direct quote: `(Author, Year, p. xx)`",
+        "",
+        "## Reference Templates",
+        "",
+        "### Journal Article",
+        "",
+        "`Author, A.A. and Author, B.B. (Year) 'Article title', Journal Title, volume(issue), pp. xx-xx. Available at: URL (Accessed: Date).`",
+        "",
+        "### Book",
+        "",
+        "`Author, A.A. (Year) Book Title. Place of publication: Publisher.`",
+        "",
+        "### Company Report",
+        "",
+        "`Company Name (Year) Report title. Available at: URL (Accessed: Date).`",
+        "",
+        "### Web Page or NGO Report",
+        "",
+        "`Organisation Name (Year) Page or report title. Available at: URL (Accessed: Date).`",
+        "",
+        "## Quality Checks",
+        "",
+        "- Make sure every in-text citation has a matching reference entry.",
+        "- Make sure every reference entry is cited in the text.",
+        "- Do not invent page numbers, authors, or publication years.",
+        "- Use the same naming convention for the same source throughout.",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
 def build_summary(
     source_file: Path,
     paragraphs: list[str],
@@ -557,9 +833,18 @@ def build_manifest(output_dir: Path) -> dict[str, object]:
             {"name": "04_research_plan.md", "purpose": "Task-to-evidence matrix for source collection and analysis."},
             {"name": "05_assignment_scaffold.md", "purpose": "Draft-ready section outline aligned to the brief."},
             {"name": "06_execution_checklist.md", "purpose": "Pre-submission checklist for drafting and QA."},
-            {"name": "07_artifact_manifest.json", "purpose": "Machine-readable list of generated workflow artifacts."},
+            {"name": "07_draft_starter.md", "purpose": "Editable draft starter with placeholders for claims, evidence, and citations."},
+            {"name": "08_figure_table_plan.md", "purpose": "Suggested visuals and tables based on the brief structure."},
+            {"name": "09_harvard_reference_guide.md", "purpose": "Harvard-style citation and reference templates."},
+            {"name": "10_artifact_manifest.json", "purpose": "Machine-readable list of generated workflow artifacts."},
         ],
     }
+
+
+def clear_generated_artifacts(target_dir: Path) -> None:
+    for pattern in ("[0-9][0-9]_*.md", "[0-9][0-9]_*.json"):
+        for file_path in target_dir.glob(pattern):
+            file_path.unlink()
 
 
 def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
@@ -568,6 +853,7 @@ def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
 
     target_dir = base_output_dir / docx_path.stem
     target_dir.mkdir(parents=True, exist_ok=True)
+    clear_generated_artifacts(target_dir)
 
     (target_dir / "01_brief_extract.md").write_text(
         build_brief_extract_markdown(docx_path, paragraphs, tables),
@@ -593,9 +879,21 @@ def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
         build_execution_checklist(summary),
         encoding="utf-8",
     )
+    (target_dir / "07_draft_starter.md").write_text(
+        build_draft_starter(summary),
+        encoding="utf-8",
+    )
+    (target_dir / "08_figure_table_plan.md").write_text(
+        build_figure_table_plan(summary),
+        encoding="utf-8",
+    )
+    (target_dir / "09_harvard_reference_guide.md").write_text(
+        build_harvard_reference_guide(),
+        encoding="utf-8",
+    )
 
     manifest = build_manifest(target_dir)
-    (target_dir / "07_artifact_manifest.json").write_text(
+    (target_dir / "10_artifact_manifest.json").write_text(
         json.dumps(manifest, indent=2),
         encoding="utf-8",
     )

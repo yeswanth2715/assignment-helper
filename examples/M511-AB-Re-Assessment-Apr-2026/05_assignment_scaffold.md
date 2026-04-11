@@ -21,7 +21,7 @@
 - Required focus: Map the firm's CSR initiatives to one of the following theories: Carroll's CSR Pyramid Stakeholder Theory Shared Value Framework (Porter & Kramer) Critically evaluate the alignment between CSR strategy and business strategy, Scope (local...
 - Theory to integrate:
 - Evidence to cite:
-- Suggested artifact: Action plan table with timing and success measures.
+- Suggested artifact: CSR initiative-to-theory mapping table or evidence matrix.
 
 ## Part 2 - ESG Performance Analysis
 

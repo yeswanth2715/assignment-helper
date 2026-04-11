@@ -26,7 +26,19 @@
       "purpose": "Pre-submission checklist for drafting and QA."
     },
     {
-      "name": "07_artifact_manifest.json",
+      "name": "07_draft_starter.md",
+      "purpose": "Editable draft starter with placeholders for claims, evidence, and citations."
+    },
+    {
+      "name": "08_figure_table_plan.md",
+      "purpose": "Suggested visuals and tables based on the brief structure."
+    },
+    {
+      "name": "09_harvard_reference_guide.md",
+      "purpose": "Harvard-style citation and reference templates."
+    },
+    {
+      "name": "10_artifact_manifest.json",
       "purpose": "Machine-readable list of generated workflow artifacts."
     }
   ]
