@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.docx
+*.pdf
+.pytest_cache/
+
+workflow_runs/
+prep/
