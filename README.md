@@ -1,17 +1,18 @@
 # Assignment Brief to Assignment Co-Pilot
 
-This repository turns a Word assignment brief into a set of assignment helper artifacts you can use locally.
+This repository turns a Word or PDF assignment brief into a set of assignment helper artifacts you can use locally.
 
 The public story is not "here is the final submitted file." The public story is "give the repo an assignment brief, and it produces the planning, structure, and drafting aids needed to complete the assignment responsibly."
 
 ## What It Does
 
-- Reads an assignment `.docx` brief.
+- Reads an assignment `.docx` or `.pdf` brief.
 - Extracts the key metadata, requirements, and rubric signals.
 - Builds an agent-style workflow for how the assignment should be executed.
 - Generates an editable draft starter, figure/table plan, and Harvard citation guide.
+- Can also carry the workflow outputs forward into a final local deliverable with relevant figures and tables.
 - Keeps the final Word or PDF submission outside the public repo.
-- Supports a one-command local run for any `.docx` dropped into `briefs/`.
+- Supports a one-command local run for any `.docx` or `.pdf` dropped into `briefs/`.
 
 ## What It Does Not Do
 
@@ -38,7 +39,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Drop one or more `.docx` briefs into `briefs/`, then run:
+Drop one or more `.docx` or `.pdf` briefs into `briefs/`, then run:
 
 ```bash
 python run_assignment_helper.py

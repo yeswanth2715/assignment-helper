@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 from scripts.generate_workflow_artifacts import generate_for_brief
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {".docx", ".pdf"}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Process every .docx brief in the briefs folder and generate assignment helper artifacts."
+        description="Process every .docx/.pdf brief in the briefs folder and generate assignment helper artifacts."
     )
     parser.add_argument(
         "--briefs-dir",
         default="briefs",
-        help="Directory containing one or more .docx assignment briefs.",
+        help="Directory containing one or more .docx or .pdf assignment briefs.",
     )
     parser.add_argument(
         "--output-dir",
@@ -30,20 +39,34 @@ def main() -> int:
     output_dir = Path(args.output_dir)
 
     if not briefs_dir.exists():
-        print(f"Brief directory not found: {briefs_dir}")
+        logger.error("Brief directory not found: %s", briefs_dir)
         return 1
 
-    briefs = sorted(briefs_dir.glob("*.docx"))
+    briefs = sorted(
+        f for f in briefs_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
     if not briefs:
-        print(f"No .docx briefs found in: {briefs_dir}")
+        logger.error("No .docx or .pdf briefs found in: %s", briefs_dir)
         return 1
 
+    errors: list[str] = []
     for brief in briefs:
-        target_dir = generate_for_brief(brief, output_dir)
-        print(f"Generated helper package for {brief.name} -> {target_dir}")
+        try:
+            target_dir = generate_for_brief(brief, output_dir)
+            logger.info("Generated helper package for %s -> %s", brief.name, target_dir)
+        except Exception:
+            logger.exception("Failed to process %s", brief.name)
+            errors.append(brief.name)
 
-    print("Done. Review the draft starter, figure plan, and checklist before writing the final submission.")
-    return 0
+    if errors:
+        logger.warning("Finished with errors in: %s", ", ".join(errors))
+    else:
+        logger.info(
+            "Done. Review the draft starter, figure plan, and checklist before writing the final submission."
+        )
+
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

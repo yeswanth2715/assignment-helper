@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 from pathlib import Path
 
 from docx import Document
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger(__name__)
 
 
 def clean_text(text: str) -> str:
@@ -17,6 +26,10 @@ def clean_text(text: str) -> str:
         .replace("\u201d", '"')
         .replace("\u2014", "-")
         .replace("\u2013", "-")
+        .replace("\u2022", "-")
+        .replace("\u00ae", "(R)")
+        .replace("\u2122", "(TM)")
+        .replace("\u00b7", "-")
     )
     return " ".join(cleaned.split())
 
@@ -44,6 +57,44 @@ def extract_document(docx_path: Path) -> tuple[list[str], list[list[list[str]]]]
     return paragraphs, tables
 
 
+def extract_pdf_document(pdf_path: Path) -> tuple[list[str], list[list[list[str]]]]:
+    """Extract paragraphs and tables from a PDF file using pdfplumber."""
+    if pdfplumber is None:
+        raise ImportError(
+            "pdfplumber is required to read PDF briefs. "
+            "Install it with: pip install pdfplumber>=0.10.0"
+        )
+
+    paragraphs: list[str] = []
+    tables: list[list[list[str]]] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            # Extract text paragraphs
+            text = page.extract_text()
+            if text:
+                for line in text.split("\n"):
+                    cleaned = clean_text(line)
+                    if cleaned:
+                        paragraphs.append(cleaned)
+
+            # Extract tables
+            page_tables = page.extract_tables()
+            if page_tables:
+                for raw_table in page_tables:
+                    rows: list[list[str]] = []
+                    for raw_row in raw_table:
+                        if raw_row is None:
+                            continue
+                        cells = [clean_text(cell) if cell else "" for cell in raw_row]
+                        if any(cells):
+                            rows.append(cells)
+                    if rows:
+                        tables.append(rows)
+
+    return paragraphs, tables
+
+
 def extract_metadata(tables: list[list[list[str]]]) -> dict[str, str]:
     metadata: dict[str, str] = {}
     if not tables:
@@ -59,6 +110,45 @@ def extract_metadata(tables: list[list[list[str]]]) -> dict[str, str]:
     return metadata
 
 
+def extract_metadata_from_paragraphs(paragraphs: list[str]) -> dict[str, str]:
+    """Fallback: extract metadata from paragraphs when tables don't contain it."""
+    metadata: dict[str, str] = {}
+    patterns = {
+        "Module": re.compile(r"(?:Module|Course)\s*:\s*(.+)", re.IGNORECASE),
+        "Length": re.compile(r"(?:Word Limit|Length|Word Count)\s*:\s*(.+)", re.IGNORECASE),
+        "To be submitted on": re.compile(r"(?:Submission Date|Due Date|Deadline)\s*:\s*(.+)", re.IGNORECASE),
+        "Submission Method": re.compile(r"(?:Submission Method|Submit via)\s*:\s*(.+)", re.IGNORECASE),
+    }
+    for para in paragraphs:
+        for key, pattern in patterns.items():
+            if key not in metadata:
+                match = pattern.search(para)
+                if match:
+                    metadata[key] = clean_text(match.group(1))
+
+    # Also try structured "Key: Value" lines
+    for para in paragraphs:
+        kv_match = re.match(
+            r"^(Assignment (?:Title|Type)|Word Limit|Weighting|Issue Date|Submission Date|Feedback Date|Issued by)\s*:\s*(.+)$",
+            para,
+            re.IGNORECASE,
+        )
+        if kv_match:
+            key = clean_text(kv_match.group(1))
+            value = clean_text(kv_match.group(2))
+            metadata[key] = value
+
+    # Word limit from inline pattern like "3000 words (+/- 300)"
+    if "Length" not in metadata:
+        for para in paragraphs:
+            wl_match = re.search(r"(\d[\d,]*\s*words\s*(?:\([^)]+\))?)", para, re.IGNORECASE)
+            if wl_match:
+                metadata["Length"] = clean_text(wl_match.group(1))
+                break
+
+    return metadata
+
+
 def collect_assignment_text(tables: list[list[list[str]]]) -> str:
     selected_chunks: list[str] = []
     for table in tables[1:5]:
@@ -69,7 +159,7 @@ def collect_assignment_text(tables: list[list[list[str]]]) -> str:
     return clean_text(" ".join(selected_chunks))
 
 
-def shorten(text: str, limit: int = 240) -> str:
+def shorten(text: str, limit: int = 500) -> str:
     trimmed = text.strip()
     if len(trimmed) <= limit:
         return trimmed
@@ -176,11 +266,103 @@ def extract_named_sections(assignment_text: str, headings: list[str]) -> list[di
     return sections
 
 
+def extract_numbered_question_sections(assignment_text: str) -> list[dict[str, str]]:
+    """Detect numbered questions like '1. Emotional Agility Analysis ... 2. Solutions ...'."""
+    pattern = re.compile(
+        r"(?:^|\s)(\d+)\.\s+([A-Z][A-Za-z ]+?)(?=\s+(?:Identify|Evaluate|Develop|Reflect|Analyze|Map|Choose|Select|Apply|Discuss|Propose|Assess|Create|Construct|Write|Explain|Compare|Recommend))",
+        re.MULTILINE,
+    )
+    matches = list(pattern.finditer(assignment_text))
+    if len(matches) < 2:
+        return []
+
+    sections: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(assignment_text)
+        title = clean_text(match.group(2))
+        body = trim_section_body(assignment_text[match.end() : end])
+        sections.append(
+            {
+                "title": title,
+                "description": shorten(body),
+                "expected_output": infer_expected_output(title),
+            }
+        )
+    return sections
+
+
+def detect_named_headings(assignment_text: str) -> list[str]:
+    """Auto-detect capitalised headings that look like section titles."""
+    heading_pattern = re.compile(
+        r"(?:^|\n)\s*(?:#{1,3}\s+)?([A-Z][A-Za-z]+(?:\s+[A-Za-z]+){1,5})\s*(?:\n|$)"
+    )
+    candidates: list[str] = []
+    for match in heading_pattern.finditer(assignment_text):
+        candidate = clean_text(match.group(1))
+        lowered = candidate.lower()
+        skip_words = ("assignment", "assessment", "guidelines", "purpose", "instructions", "criteria", "marking", "notes")
+        if not any(word in lowered for word in skip_words) and len(candidate) > 5:
+            candidates.append(candidate)
+    return candidates
+
+
+def extract_research_paper_sections(text: str) -> list[dict[str, str]]:
+    """Detect numbered research paper sections like '1. Title', '2. Abstract (150-250 words)', etc."""
+    # Works on both newline-structured and flat (joined paragraph) text
+    pattern = re.compile(
+        r"(?:(?:^|\n|(?<=\s))|(?<=\.\s))(\d+)\.\s+((?:Title|Abstract|Introduction|Literature Review|Methodology|Results(?:\s+and\s+Data\s+Analysis)?|Data\s+Analysis|Discussion|Conclusion|Acknowledgements(?:\s+and\s+References)?|References)[^\n.]*)",
+        re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) < 3:
+        return []
+
+    sections: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        raw_title = clean_text(match.group(2).split("(")[0])  # Strip word-count hints like "(150-250 words)"
+        # Strip directives that bleed into the title (e.g. "Title The title should be...")
+        raw_title = re.sub(r"\s+-\s+.*$", "", raw_title).strip()
+        # Limit title to first 6 words maximum
+        title_words = raw_title.split()
+        title = " ".join(title_words[:6]).rstrip(":")
+        body = trim_section_body(text[match.end() : end])
+
+        # Extract word-count hint if present
+        wc_hint = ""
+        wc_match = re.search(r"\((\d+-\d+\s*words)\)", match.group(2), re.IGNORECASE)
+        if wc_match:
+            wc_hint = f" [{wc_match.group(1)}]"
+
+        sections.append(
+            {
+                "title": title.strip(),
+                "description": shorten(body) + wc_hint,
+                "expected_output": infer_expected_output(title),
+            }
+        )
+    return sections
+
+
 def extract_task_sections(assignment_text: str) -> list[dict[str, str]]:
     part_sections = extract_part_sections(assignment_text)
     if part_sections:
         return part_sections
 
+    # Try research paper structure (numbered: Title, Abstract, Introduction, ...)
+    research_sections = extract_research_paper_sections(assignment_text)
+    if research_sections:
+        return research_sections
+
+    # Try explicit named headings from the brief
+    known_headings = detect_named_headings(assignment_text)
+    if known_headings:
+        named_sections = extract_named_sections(assignment_text, known_headings)
+        if named_sections:
+            return named_sections
+
+    # Fallback: known M521-style headings
     named_sections = extract_named_sections(
         assignment_text,
         [
@@ -192,6 +374,12 @@ def extract_task_sections(assignment_text: str) -> list[dict[str, str]]:
     if named_sections:
         return named_sections
 
+    # Fallback: numbered questions
+    numbered = extract_numbered_question_sections(assignment_text)
+    if numbered:
+        return numbered
+
+    logger.warning("Could not detect task sections; using single catch-all section.")
     return [
         {
             "title": "Assignment Brief",
@@ -232,6 +420,29 @@ def extract_weighted_criteria(tables: list[list[list[str]]]) -> list[dict[str, s
             seen.add(key)
             criteria.append({"criterion": clean_criterion, "weight": clean_text(weight)})
 
+    return criteria
+
+
+def extract_grading_criteria_from_table(tables: list[list[list[str]]]) -> list[dict[str, str]]:
+    """Extract rubric criteria from multi-column grading tables (no explicit mark weights)."""
+    criteria: list[dict[str, str]] = []
+    for table in tables:
+        table_text = clean_text(" ".join(" ".join(row) for row in table)).lower()
+        if "grading" not in table_text and "criteria" not in table_text:
+            continue
+        for row in table:
+            if not row:
+                continue
+            criterion_name = clean_text(row[0])
+            lowered = criterion_name.lower()
+            if not criterion_name or len(criterion_name) < 5:
+                continue
+            if "grading" in lowered or "criteria" in lowered:
+                continue
+            # The remaining columns are band descriptors, not weights
+            criteria.append(
+                {"criterion": criterion_name, "weight": "equally weighted"}
+            )
     return criteria
 
 
@@ -281,15 +492,19 @@ def build_brief_extract_markdown(
 
 def recommend_sources(section_title: str) -> str:
     lowered = section_title.lower()
-    if "csr" in lowered or "esg" in lowered:
-        return "Company sustainability reports, ESG ratings, annual reports, competitor disclosures, and core CSR/ESG theory."
+    if "csr" in lowered:
+        return "Company sustainability/CSR reports, Carroll (1991), Porter and Kramer (2011), stakeholder theory literature, and competitor CSR disclosures."
+    if "esg" in lowered:
+        return "ESG rating agencies (MSCI, Sustainalytics), GRI/SASB materiality standards, company sustainability reports, and competitor ESG benchmarks."
     if "ethical" in lowered:
-        return "Ethics literature, NGO or watchdog coverage, policy standards, and company responses."
+        return "Applied ethics literature (Crane and Matten, 2019), NGO/watchdog reports, case-specific media coverage, and company policy responses."
     if "reflection" in lowered:
-        return "Module theory, case incidents, and first-person reflection prompts."
-    if "strategy" in lowered or "recommend" in lowered:
-        return "Improvement frameworks, applied management literature, and feasibility evidence."
-    return "Academic theory, public company or case evidence, and relevant comparator material."
+        return "Module theory (e.g. David, 2016 on emotional agility), reflective practice frameworks (Gibbs, Kolb), and personal incident notes."
+    if "emotional" in lowered or "agility" in lowered:
+        return "David (2016) Emotional Agility, Goleman (1995) Emotional Intelligence, Hayes et al. (2006) ACT, and leadership transition literature."
+    if "solution" in lowered or "strategy" in lowered or "recommend" in lowered:
+        return "Change management frameworks, applied leadership literature, feasibility evidence, and action-research methodology."
+    return "Academic peer-reviewed journals, professional/industry reports, and relevant comparator case studies."
 
 
 def recommend_artifact(section_title: str) -> str:
@@ -305,6 +520,83 @@ def recommend_artifact(section_title: str) -> str:
     if "strategy" in lowered:
         return "Action plan table with timing and success measures."
     return "Argument map or evidence table."
+
+
+def extract_learning_outcomes(tables: list[list[list[str]]]) -> list[str]:
+    """Extract learning outcomes (LO1, LO2, ...) from brief tables."""
+    outcomes: list[str] = []
+    for table in tables:
+        for row in table:
+            text = " ".join(cell for cell in row if cell)
+            lo_matches = re.findall(
+                r"(LO\d+):\s*([^.]+\.)",
+                text,
+                re.IGNORECASE,
+            )
+            for lo_id, lo_text in lo_matches:
+                entry = f"{lo_id.upper()}: {clean_text(lo_text)}"
+                if entry not in outcomes:
+                    outcomes.append(entry)
+    return outcomes
+
+
+def extract_los_from_paragraphs(paragraphs: list[str]) -> list[str]:
+    """Fallback: extract LOs from paragraph text when they're not in tables."""
+    outcomes: list[str] = []
+    # Scan individual paragraphs AND the full joined text (handles multi-line LOs in PDFs)
+    candidates = list(paragraphs) + [" ".join(paragraphs)]
+    seen: set[str] = set()
+    for text in candidates:
+        lo_matches = re.findall(
+            r"(LO\d+)\s*:?\s+([A-Z][^.]+\.)",
+            text,
+        )
+        for lo_id, lo_text in lo_matches:
+            entry = f"{lo_id.upper()}: {clean_text(lo_text)}"
+            if entry not in seen:
+                seen.add(entry)
+                outcomes.append(entry)
+    return outcomes
+
+
+def word_count_budget(
+    word_limit: str,
+    rubric_criteria: list[dict[str, str]],
+    num_sections: int,
+) -> list[tuple[str, int]]:
+    """Estimate a per-section word budget from rubric weights and total word count."""
+    match = re.search(r"([\d,]+)\s*words", word_limit, re.IGNORECASE)
+    if not match:
+        return []
+    total = int(match.group(1).replace(",", ""))
+
+    # Parse numeric weights from rubric criteria
+    weights: list[tuple[str, float]] = []
+    for criterion in rubric_criteria:
+        w_match = re.search(r"(\d+)", criterion.get("weight", ""))
+        if w_match:
+            weights.append((criterion["criterion"], float(w_match.group(1))))
+
+    if not weights:
+        # Distribute evenly across sections + intro + conclusion
+        per_section = total // (num_sections + 2)
+        budget = [("Introduction", per_section)]
+        budget += [(f"Section {i+1}", per_section) for i in range(num_sections)]
+        budget.append(("Conclusion", per_section))
+        return budget
+
+    total_weight = sum(w for _, w in weights)
+    if total_weight == 0:
+        return []
+
+    budget: list[tuple[str, int]] = []
+    # Reserve ~10% for intro + conclusion
+    body_words = int(total * 0.9)
+    budget.append(("Introduction", int(total * 0.05)))
+    for name, weight in weights:
+        budget.append((name, int(body_words * weight / total_weight)))
+    budget.append(("Conclusion", int(total * 0.05)))
+    return budget
 
 
 def build_research_plan(summary: dict[str, object]) -> str:
@@ -431,6 +723,33 @@ def build_assignment_scaffold(summary: dict[str, object]) -> str:
         "",
     ]
 
+    # Word-count allocation table
+    budget = word_count_budget(
+        str(summary.get("word_limit", "")),
+        summary.get("rubric_criteria", []),
+        len(summary.get("task_sections", [])),
+    )
+    if budget:
+        lines.extend(
+            [
+                "## Word-Count Allocation (Indicative)",
+                "",
+                "| Section | Approx. words |",
+                "| --- | --- |",
+            ]
+        )
+        for name, words in budget:
+            lines.append(f"| {name} | ~{words} |")
+        lines.append("")
+
+    # Learning outcomes mapping
+    los = summary.get("learning_outcomes", [])
+    if los:
+        lines.extend(["## Learning Outcomes Addressed", ""])
+        for lo in los:
+            lines.append(f"- {lo}")
+        lines.append("")
+
     if include_exec_summary:
         lines.extend(
             [
@@ -480,6 +799,10 @@ def build_assignment_scaffold(summary: dict[str, object]) -> str:
 
 
 def build_execution_checklist(summary: dict[str, object]) -> str:
+    word_limit = str(summary.get("word_limit", ""))
+    match = re.search(r"([\d,]+)\s*words", word_limit, re.IGNORECASE)
+    word_count_str = match.group(1) if match else "[check brief]"
+
     lines = [
         f"# Execution Checklist: {summary['title']}",
         "",
@@ -494,6 +817,7 @@ def build_execution_checklist(summary: dict[str, object]) -> str:
         "- [ ] Turn every brief section into a draft section or subsection.",
         "- [ ] Identify the theories, frameworks, or models required.",
         "- [ ] Build a source list for both academic and practical evidence.",
+        "- [ ] Map each learning outcome to the section(s) that address it.",
         "",
         "## Drafting",
         "",
@@ -505,16 +829,32 @@ def build_execution_checklist(summary: dict[str, object]) -> str:
     lines.extend(
         [
             "",
-            "## Quality Gate",
+            "## Quality Gate — MSc Standard",
             "",
-            "- [ ] Make sure the answer is analytical, not just descriptive.",
-            "- [ ] Check that recommendations or reflections follow logically from the analysis.",
-            "- [ ] Confirm Harvard referencing and citation consistency.",
-            "- [ ] Check visuals, tables, and appendices for relevance.",
+            f"- [ ] Word count is within {word_count_str} +/- 10% (excluding title page, contents, executive summary, references, appendices).",
+            "- [ ] Every rubric criterion is demonstrably addressed in the text.",
+            "- [ ] Every learning outcome (LO) is covered by at least one section.",
+            "- [ ] The answer is analytical and evaluative, not just descriptive.",
+            "- [ ] Recommendations or reflections follow logically from the analysis.",
+            "- [ ] Each section integrates relevant academic theory (not just practice).",
+            "- [ ] Harvard referencing is consistent: every in-text citation has a reference entry and vice versa.",
+            "- [ ] Sources include a mix of peer-reviewed journals, professional reports, and primary data.",
+            "- [ ] Visuals and tables do analytical work; each has a descriptive caption and source line.",
+            "- [ ] Submission format matches the brief (Word or PDF, file naming convention).",
+            "- [ ] Final draft has been proofread for grammar, spelling, and academic tone.",
+            "- [ ] Turnitin/originality check completed; no unattributed content.",
             "- [ ] Export the final Word or PDF locally without committing it to Git.",
             "",
         ]
     )
+
+    # Learning outcomes checklist
+    los = summary.get("learning_outcomes", [])
+    if los:
+        lines.extend(["## Learning Outcome Coverage", ""])
+        for lo in los:
+            lines.append(f"- [ ] {lo}")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -618,11 +958,28 @@ def build_draft_starter(summary: dict[str, object]) -> str:
             "- [Add only sources you actually used and verified.]",
             "- [Format them in Harvard style using the guide in `09_harvard_reference_guide.md`.]",
             "",
+            "## Rubric Self-Audit",
+            "",
+        ]
+    )
+
+    rubric_criteria = summary.get("rubric_criteria", [])
+    if rubric_criteria:
+        for criterion in rubric_criteria:
+            lines.append(f"- [ ] **{criterion['criterion']}** ({criterion['weight']}): [Note where and how you demonstrate this.]")
+    else:
+        lines.append("- [ ] [Check rubric criteria and confirm each is addressed in the text.]")
+
+    lines.extend(
+        [
+            "",
             "## Final Check Before Submission",
             "",
             "- [ ] Every citation matches a real source.",
             "- [ ] Every claim is supported by evidence.",
             "- [ ] All placeholders have been replaced.",
+            "- [ ] Word count is within the permitted range.",
+            "- [ ] Submission format matches the brief requirements.",
             "- [ ] The assignment reflects your own judgement and writing.",
             "",
         ]
@@ -762,6 +1119,7 @@ def build_harvard_reference_guide() -> str:
         "- Two authors: `(Author and Author, Year)`",
         "- Three or more authors: `(Author et al., Year)`",
         "- Direct quote: `(Author, Year, p. xx)`",
+        "- Secondary citation: `(Author, Year, cited in Author, Year)`",
         "",
         "## Reference Templates",
         "",
@@ -773,9 +1131,25 @@ def build_harvard_reference_guide() -> str:
         "",
         "`Author, A.A. (Year) Book Title. Place of publication: Publisher.`",
         "",
+        "### Book Chapter (Edited Collection)",
+        "",
+        "`Author, A.A. (Year) 'Chapter title', in Editor, E.E. (ed.) Book Title. Place of publication: Publisher, pp. xx-xx.`",
+        "",
+        "### Conference Paper",
+        "",
+        "`Author, A.A. (Year) 'Paper title', Proceedings of Conference Name. Location, Date. Place of publication: Publisher, pp. xx-xx.`",
+        "",
         "### Company Report",
         "",
         "`Company Name (Year) Report title. Available at: URL (Accessed: Date).`",
+        "",
+        "### Government or Policy Report",
+        "",
+        "`Department/Agency Name (Year) Report title. Place of publication: Publisher. Available at: URL (Accessed: Date).`",
+        "",
+        "### Newspaper Article",
+        "",
+        "`Author, A.A. (Year) 'Article title', Newspaper Title, Date, p. xx. Available at: URL (Accessed: Date).`",
         "",
         "### Web Page or NGO Report",
         "",
@@ -787,6 +1161,8 @@ def build_harvard_reference_guide() -> str:
         "- Make sure every reference entry is cited in the text.",
         "- Do not invent page numbers, authors, or publication years.",
         "- Use the same naming convention for the same source throughout.",
+        "- Aim for a balance of peer-reviewed and professional sources.",
+        "- Secondary citations should be used sparingly; always try to access the original source.",
         "",
     ]
 
@@ -799,15 +1175,41 @@ def build_summary(
     tables: list[list[list[str]]],
 ) -> dict[str, object]:
     metadata = extract_metadata(tables)
+    # Fallback: extract metadata from paragraphs if table-based extraction is thin
+    if len(metadata) < 3:
+        para_meta = extract_metadata_from_paragraphs(paragraphs)
+        for key, value in para_meta.items():
+            metadata.setdefault(key, value)
+
     assignment_text = collect_assignment_text(tables)
+    # Prefer paragraph text when it's significantly richer — common for PDFs
+    # where assignment instructions appear as plain text rather than in tables
+    full_para_text = " ".join(paragraphs)
+    if len(full_para_text) > len(assignment_text) * 2:
+        assignment_text = full_para_text
+    elif len(assignment_text) < 200 and full_para_text:
+        assignment_text = full_para_text
+
     task_sections = extract_task_sections(assignment_text)
     rubric_criteria = extract_weighted_criteria(tables)
+    # Fallback: extract from grading criteria table
+    if not rubric_criteria:
+        rubric_criteria = extract_grading_criteria_from_table(tables)
+
+    learning_outcomes = extract_learning_outcomes(tables)
+    # Fallback: extract LOs from paragraphs
+    if not learning_outcomes:
+        learning_outcomes = extract_los_from_paragraphs(paragraphs)
 
     title = extract_assignment_title(paragraphs, assignment_text)
     module = metadata.get("Module", "")
-    due_date = metadata.get("To be submitted on", "") or metadata.get("To be submitted on:", "")
+    due_date = (
+        metadata.get("To be submitted on", "")
+        or metadata.get("To be submitted on:", "")
+        or metadata.get("Submission Date", "")
+    )
     submission_method = metadata.get("Submission Method", "")
-    word_limit = metadata.get("Length", "")
+    word_limit = metadata.get("Length", "") or metadata.get("Word Limit", "")
 
     summary = {
         "source_file": source_file.name,
@@ -819,6 +1221,7 @@ def build_summary(
         "word_limit": word_limit,
         "task_sections": task_sections,
         "rubric_criteria": rubric_criteria,
+        "learning_outcomes": learning_outcomes,
     }
     return summary
 
@@ -841,63 +1244,397 @@ def build_manifest(output_dir: Path) -> dict[str, object]:
     }
 
 
-def clear_generated_artifacts(target_dir: Path) -> None:
-    for pattern in ("[0-9][0-9]_*.md", "[0-9][0-9]_*.json"):
-        for file_path in target_dir.glob(pattern):
-            file_path.unlink()
+def _add_md_section_to_docx(doc: Document, md_text: str) -> None:
+    """Parse simple markdown text and add it to a python-docx Document."""
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    for line in md_text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Headings
+        if stripped.startswith("### "):
+            p = doc.add_heading(stripped[4:], level=3)
+        elif stripped.startswith("## "):
+            p = doc.add_heading(stripped[3:], level=2)
+        elif stripped.startswith("# "):
+            p = doc.add_heading(stripped[2:], level=1)
+        # Bullet points
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            p = doc.add_paragraph(stripped[2:], style="List Bullet")
+        # Numbered items
+        elif re.match(r"^\d+\.\s", stripped):
+            text = re.sub(r"^\d+\.\s*", "", stripped)
+            p = doc.add_paragraph(text, style="List Number")
+        # Table rows (markdown tables)
+        elif stripped.startswith("|") and stripped.endswith("|"):
+            # Skip separator rows like |---|---|
+            if re.match(r"^\|[\s\-:|]+\|$", stripped):
+                continue
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            # Create a table for the first row, or add rows to existing
+            if not hasattr(doc, "_last_md_table") or doc._last_md_table is None:
+                tbl = doc.add_table(rows=1, cols=len(cells))
+                tbl.style = "Light Grid Accent 1"
+                for i, cell in enumerate(cells):
+                    tbl.rows[0].cells[i].text = cell
+                doc._last_md_table = tbl  # type: ignore[attr-defined]
+            else:
+                tbl = doc._last_md_table
+                row = tbl.add_row()
+                for i, cell in enumerate(cells):
+                    if i < len(row.cells):
+                        row.cells[i].text = cell
+        # Backtick code blocks — just add as plain text
+        elif stripped.startswith("`") and stripped.endswith("`"):
+            p = doc.add_paragraph()
+            run = p.add_run(stripped.strip("`"))
+            run.font.name = "Courier New"
+            run.font.size = Pt(9)
+        # Regular paragraph
+        else:
+            doc.add_paragraph(stripped)
+
+        # Reset table tracker when we hit a non-table line
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            doc._last_md_table = None  # type: ignore[attr-defined]
+
+
+def build_combined_docx(summary: dict[str, object], source_file: Path) -> Document:
+    """Build a single Word document containing the actual assignment draft content."""
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+
+    # ── Title page ──
+    # Add some blank space
+    for _ in range(4):
+        doc.add_paragraph("")
+
+    title_para = doc.add_heading(str(summary.get("title", "Assignment")), level=0)
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if summary.get("module"):
+        run = subtitle.add_run(f"Module: {summary['module']}\n")
+        run.font.size = Pt(14)
+    if summary.get("assessment_type"):
+        run = subtitle.add_run(f"Assessment Type: {summary['assessment_type']}\n")
+        run.font.size = Pt(12)
+    if summary.get("word_limit"):
+        run = subtitle.add_run(f"Word Limit: {summary['word_limit']}\n")
+        run.font.size = Pt(12)
+    if summary.get("due_date"):
+        run = subtitle.add_run(f"Submission Date: {summary['due_date']}\n")
+        run.font.size = Pt(12)
+
+    student_info = doc.add_paragraph()
+    student_info.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = student_info.add_run("\nStudent Name: [Your Name]\nStudent ID: [Your ID]")
+    run.font.size = Pt(12)
+
+    doc.add_page_break()
+
+    # ── Word count allocation (if available) ──
+    word_limit = str(summary.get("word_limit", ""))
+    task_sections = summary.get("task_sections", [])  # type: ignore[assignment]
+    rubric_criteria = summary.get("rubric_criteria", [])  # type: ignore[assignment]
+    learning_outcomes = summary.get("learning_outcomes", [])  # type: ignore[assignment]
+
+    budget = word_count_budget(word_limit, rubric_criteria, len(task_sections))  # type: ignore[arg-type]
+
+    if budget:
+        doc.add_heading("Indicative Word-Count Allocation", level=2)
+        tbl = doc.add_table(rows=1, cols=2)
+        tbl.style = "Light Grid Accent 1"
+        tbl.rows[0].cells[0].text = "Section"
+        tbl.rows[0].cells[1].text = "Approx. Words"
+        for section_name, word_count in budget:
+            row = tbl.add_row()
+            row.cells[0].text = section_name
+            row.cells[1].text = f"~{word_count}"
+        doc.add_paragraph("")
+
+    # ── Learning outcomes ──
+    if learning_outcomes:
+        doc.add_heading("Learning Outcomes Addressed", level=2)
+        for lo in learning_outcomes:  # type: ignore[union-attr]
+            doc.add_paragraph(str(lo), style="List Bullet")
+        doc.add_paragraph("")
+
+    doc.add_page_break()
+
+    # ── Introduction ──
+    doc.add_heading("Introduction", level=1)
+    intro_guide = doc.add_paragraph()
+    run = intro_guide.add_run(
+        "[Frame the assignment topic, define the scope, state the research problem/questions, "
+        "and outline the structure of the paper. Include at least one verified citation to establish context.]"
+    )
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    run.font.size = Pt(11)
+    doc.add_paragraph("")
+
+    # ── Each detected section as a real draft section ──
+    for section in task_sections:  # type: ignore[union-attr]
+        section_title = str(section.get("title", "Untitled"))  # type: ignore[union-attr]
+        section_desc = str(section.get("description", ""))  # type: ignore[union-attr]
+
+        # Skip if the section is basically the intro or conclusion (we add those separately)
+        title_lower = section_title.lower()
+        if title_lower in ("introduction", "conclusion"):
+            continue
+
+        doc.add_heading(section_title, level=1)
+
+        # Brief requirement as guidance note
+        if section_desc:
+            guide_para = doc.add_paragraph()
+            run = guide_para.add_run(f"Brief requirement: {section_desc}")
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+            run.font.size = Pt(10)
+            run.italic = True
+            doc.add_paragraph("")
+
+        # Theory / framework placeholder
+        theory_head = doc.add_paragraph()
+        run = theory_head.add_run("Theory or framework to apply:")
+        run.bold = True
+        run.font.size = Pt(11)
+        theory_placeholder = doc.add_paragraph()
+        run = theory_placeholder.add_run("[Add the named model, theory, or standard you will use in this section.]")
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        doc.add_paragraph("")
+
+        # Evidence slots
+        evidence_head = doc.add_paragraph()
+        run = evidence_head.add_run("Evidence to insert:")
+        run.bold = True
+        run.font.size = Pt(11)
+        for i in range(1, 4):
+            ev = doc.add_paragraph(style="List Bullet")
+            run = ev.add_run(f"[Source {i}: what it proves — (Author, Year)]")
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        doc.add_paragraph("")
+
+        # Draft paragraph plan
+        plan_head = doc.add_paragraph()
+        run = plan_head.add_run("Draft paragraph plan:")
+        run.bold = True
+        run.font.size = Pt(11)
+
+        para_plans = [
+            "Set context and scope.",
+            "Apply theory or framework.",
+            "Critically evaluate the evidence.",
+            "State implications, comparison, or recommendation.",
+        ]
+        for j, plan in enumerate(para_plans, 1):
+            pp = doc.add_paragraph(style="List Number")
+            run = pp.add_run(f"[{plan}]")
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+        # Source recommendation
+        sources = recommend_sources(section_title)
+        if sources:
+            src_head = doc.add_paragraph()
+            run = src_head.add_run("Recommended sources: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run = src_head.add_run(sources)
+            run.font.size = Pt(10)
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+        doc.add_paragraph("")
+
+    # ── Conclusion ──
+    doc.add_heading("Conclusion", level=1)
+    concl_guide = doc.add_paragraph()
+    run = concl_guide.add_run(
+        "[Summarise the key findings, highlight the contribution of the study, "
+        "and suggest future research directions. Do not introduce new material here.]"
+    )
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    run.font.size = Pt(11)
+    doc.add_paragraph("")
+
+    doc.add_page_break()
+
+    # ── Reference List ──
+    doc.add_heading("Reference List", level=1)
+    ref_guide = doc.add_paragraph()
+    run = ref_guide.add_run("Harvard Referencing Format — add only sources you actually used and verified.")
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    run.italic = True
+    doc.add_paragraph("")
+
+    # Add reference format examples
+    ref_templates = [
+        ("Journal Article", "Author, A.A. and Author, B.B. (Year) 'Article title', Journal Title, volume(issue), pp. xx-xx."),
+        ("Book", "Author, A.A. (Year) Book Title. Place of publication: Publisher."),
+        ("Book Chapter", "Author, A.A. (Year) 'Chapter title', in Editor, E.E. (ed.) Book Title. Publisher, pp. xx-xx."),
+        ("Web / Report", "Organisation (Year) Title. Available at: URL (Accessed: Date)."),
+    ]
+    for ref_type, template in ref_templates:
+        p = doc.add_paragraph()
+        run = p.add_run(f"[{ref_type}]: ")
+        run.bold = True
+        run.font.size = Pt(10)
+        run = p.add_run(template)
+        run.font.name = "Courier New"
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    doc.add_paragraph("")
+    doc.add_page_break()
+
+    # ── Rubric Self-Audit ──
+    doc.add_heading("Rubric Self-Audit", level=1)
+    audit_intro = doc.add_paragraph()
+    run = audit_intro.add_run("Check each criterion before submission:")
+    run.italic = True
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    doc.add_paragraph("")
+
+    if rubric_criteria:
+        for crit in rubric_criteria:  # type: ignore[union-attr]
+            p = doc.add_paragraph(style="List Bullet")
+            crit_name = str(crit.get("criterion", ""))  # type: ignore[union-attr]
+            crit_weight = str(crit.get("weight", ""))  # type: ignore[union-attr]
+            run = p.add_run(f"☐ {crit_name} ({crit_weight}): ")
+            run.bold = True
+            run = p.add_run("[Note where and how you address this in your paper.]")
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    else:
+        doc.add_paragraph("☐ [Check rubric criteria and confirm each is addressed.]", style="List Bullet")
+
+    doc.add_paragraph("")
+
+    # ── Final submission checks ──
+    doc.add_heading("Final Checks Before Submission", level=2)
+    checks = [
+        "Every citation matches a real, verified source.",
+        "Every claim is supported by evidence.",
+        "All placeholder text has been replaced with your own writing.",
+        "Word count is within the permitted range.",
+        "Submission format matches the brief requirements.",
+        "Turnitin similarity is acceptable.",
+        "The assignment reflects your own judgement and critical analysis.",
+    ]
+    for check in checks:
+        doc.add_paragraph(f"☐ {check}", style="List Bullet")
+
+    return doc
+
+
+def build_output_summary_markdown(summary: dict[str, object], source_file: Path, docx_name: str) -> str:
+    """Build a single markdown summary of what was generated."""
+    lines: list[str] = [
+        f"# Assignment Co-Pilot Output Summary",
+        "",
+        f"**Source brief:** `{source_file.name}`",
+        f"**Generated file:** `{docx_name}`",
+        "",
+        "---",
+        "",
+        "## Brief Metadata",
+        "",
+        f"| Field | Value |",
+        f"| --- | --- |",
+        f"| Title | {summary.get('title', 'N/A')} |",
+        f"| Module | {summary.get('module', 'N/A')} |",
+        f"| Assessment Type | {summary.get('assessment_type', 'N/A')} |",
+        f"| Word Limit | {summary.get('word_limit', 'N/A')} |",
+        f"| Due Date | {summary.get('due_date', 'N/A')} |",
+        "",
+        "## Sections Detected",
+        "",
+    ]
+
+    task_sections = summary.get("task_sections", [])
+    for i, sec in enumerate(task_sections, 1):  # type: ignore[arg-type]
+        desc = sec.get("description", "")  # type: ignore[union-attr]
+        title = sec.get("title", "Untitled")  # type: ignore[union-attr]
+        lines.append(f"{i}. **{title}**" + (f" — {desc[:80]}..." if len(desc) > 80 else (f" — {desc}" if desc else "")))
+    lines.append("")
+
+    learning_outcomes = summary.get("learning_outcomes", [])
+    if learning_outcomes:
+        lines.append("## Learning Outcomes")
+        lines.append("")
+        for lo in learning_outcomes:  # type: ignore[union-attr]
+            lines.append(f"- {lo}")
+        lines.append("")
+
+    rubric_criteria = summary.get("rubric_criteria", [])
+    if rubric_criteria:
+        lines.append("## Rubric Criteria")
+        lines.append("")
+        for crit in rubric_criteria:  # type: ignore[union-attr]
+            lines.append(f"- **{crit['criterion']}** ({crit['weight']})")  # type: ignore[index]
+        lines.append("")
+
+    lines.extend([
+        "## What's Inside the `.docx`",
+        "",
+        "| Section | Description |",
+        "| --- | --- |",
+        "| Assignment Scaffold | Section-by-section outline with word-count allocation and LO mapping |",
+        "| Execution Checklist | 13-point MSc-quality pre-submission checklist |",
+        "| Research Plan | Task-to-evidence matrix for source collection |",
+        "| Draft Starter | Editable draft with placeholders and rubric self-audit |",
+        "| Figure & Table Plan | Suggested visuals and data tables |",
+        "| Harvard Reference Guide | Citation templates for 8 source types |",
+        "| Agent Workflow | Roles, handoffs, and done criteria |",
+        "",
+    ])
+
+    return "\n".join(lines)
 
 
 def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
-    paragraphs, tables = extract_document(docx_path)
+    if not docx_path.exists():
+        raise FileNotFoundError(f"Brief file not found: {docx_path}")
+
+    suffix = docx_path.suffix.lower()
+    if suffix not in (".docx", ".pdf"):
+        raise ValueError(f"Expected a .docx or .pdf file, got: {docx_path.suffix}")
+
+    if suffix == ".pdf":
+        paragraphs, tables = extract_pdf_document(docx_path)
+    else:
+        paragraphs, tables = extract_document(docx_path)
+
+    if not tables:
+        raise ValueError(f"No tables found in {docx_path.name}; cannot extract assignment metadata.")
+
     summary = build_summary(docx_path, paragraphs, tables)
+    logger.info("Built summary for %s: %d task sections, %d rubric criteria.",
+                docx_path.name, len(summary.get("task_sections", [])), len(summary.get("rubric_criteria", [])))
 
     target_dir = base_output_dir / docx_path.stem
     target_dir.mkdir(parents=True, exist_ok=True)
-    clear_generated_artifacts(target_dir)
 
-    (target_dir / "01_brief_extract.md").write_text(
-        build_brief_extract_markdown(docx_path, paragraphs, tables),
-        encoding="utf-8",
-    )
-    (target_dir / "02_brief_summary.json").write_text(
-        json.dumps(summary, indent=2),
-        encoding="utf-8",
-    )
-    (target_dir / "03_agent_workflow.md").write_text(
-        build_agent_workflow(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "04_research_plan.md").write_text(
-        build_research_plan(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "05_assignment_scaffold.md").write_text(
-        build_assignment_scaffold(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "06_execution_checklist.md").write_text(
-        build_execution_checklist(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "07_draft_starter.md").write_text(
-        build_draft_starter(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "08_figure_table_plan.md").write_text(
-        build_figure_table_plan(summary),
-        encoding="utf-8",
-    )
-    (target_dir / "09_harvard_reference_guide.md").write_text(
-        build_harvard_reference_guide(),
-        encoding="utf-8",
-    )
+    # Clean up old artifacts (both old-style numbered and new-style)
+    for pattern in ("*.md", "*.json", "*.docx"):
+        for file_path in target_dir.glob(pattern):
+            file_path.unlink()
 
-    manifest = build_manifest(target_dir)
-    (target_dir / "10_artifact_manifest.json").write_text(
-        json.dumps(manifest, indent=2),
-        encoding="utf-8",
-    )
+    # Build and save the single .docx
+    docx_name = f"{docx_path.stem}_helper.docx"
+    doc = build_combined_docx(summary, docx_path)
+    doc.save(str(target_dir / docx_name))
 
+    # Build and save the single .md summary
+    md_name = f"{docx_path.stem}_summary.md"
+    md_content = build_output_summary_markdown(summary, docx_path, docx_name)
+    (target_dir / md_name).write_text(md_content, encoding="utf-8")
+
+    logger.info("Generated %s and %s in %s", docx_name, md_name, target_dir)
     return target_dir
 
 
