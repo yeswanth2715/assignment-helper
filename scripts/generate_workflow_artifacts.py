@@ -14,20 +14,7 @@ try:
 except ImportError:
     pdfplumber = None  # type: ignore[assignment]
 
-try:
-    from .content_generator import (
-        generate_conclusion,
-        generate_figure_data,
-        generate_introduction,
-        generate_references,
-        generate_section_content,
-        generate_table_data,
-    )
-    from .llm_client import LLMConfig
-except ImportError:
-    LLMConfig = None  # type: ignore[assignment]
-    generate_section_content = None  # type: ignore[assignment]
-
+from .content_generator import build_template_content
 
 logger = logging.getLogger(__name__)
 
@@ -1427,71 +1414,7 @@ def _add_md_section_to_docx(doc: Document, md_text: str) -> None:
             doc._last_md_table = None  # type: ignore[attr-defined]
 
 
-# ── LLM-based content generation ──
-
-
-def _generate_full_content(
-    summary: dict[str, Any],
-    config: LLMConfig,
-) -> dict[str, Any]:
-    """Generate complete assignment content via LLM for all sections."""
-    from .content_generator import (
-        generate_conclusion,
-        generate_figure_data,
-        generate_introduction,
-        generate_references,
-        generate_section_content,
-        generate_table_data,
-    )
-
-    logger.info("Generating content via LLM (%s / %s) ...", config.provider, config.model)
-
-    sections_content: list[dict[str, Any]] = []
-    all_references: list[dict[str, str]] = []
-    all_tables: list[dict[str, Any]] = []
-    all_figures: list[dict[str, Any]] = []
-
-    for sec in summary.get("task_sections", []):
-        title = sec.get("title", "")
-        desc = sec.get("description", "")
-        sub_tasks: list[str] = sec.get("sub_tasks", [])
-        logger.info("  Writing section: %s", title)
-        body = generate_section_content(title, desc, sub_tasks, summary, config)
-        sections_content.append({"title": title, "body": body})
-
-        # Generate a table for this section
-        table_data = generate_table_data(title, summary, config)
-        if table_data:
-            all_tables.append({"section": title, **table_data})
-
-        # Generate figure data (for ~half the sections)
-        if len(all_figures) < 3:
-            fig_data = generate_figure_data(title, summary, config)
-            if fig_data:
-                all_figures.append({"section": title, **fig_data})
-
-    logger.info("  Writing introduction ...")
-    intro = generate_introduction(summary, config)
-
-    logger.info("  Writing conclusion ...")
-    conclusion = generate_conclusion(summary, config)
-
-    logger.info("  Generating references ...")
-    refs = generate_references(summary, config)
-    if refs:
-        all_references = refs
-
-    return {
-        "introduction": intro,
-        "sections": sections_content,
-        "conclusion": conclusion,
-        "references": all_references,
-        "tables": all_tables,
-        "figures": all_figures,
-    }
-
-
-def render_figure_from_data(fig_data: dict[str, Any], figures_dir: Path, index: int) -> Path | None:
+def _render_figure(fig_data: dict[str, Any], figures_dir: Path, index: int) -> Path | None:
     """Render a matplotlib figure from structured data."""
     import matplotlib
     matplotlib.use("Agg")
@@ -1581,7 +1504,7 @@ def _add_table_to_docx(doc: Document, headers: list[str], rows: list[list[str]])
                 cells[i].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
 
-def build_combined_docx(summary: dict[str, object], source_file: Path, llm_content: dict[str, Any] | None = None) -> Document:
+def build_combined_docx(summary: dict[str, object], source_file: Path, content: dict[str, Any] | None = None) -> Document:
     """Build a single Word document containing the actual assignment draft content."""
     from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1649,12 +1572,12 @@ def build_combined_docx(summary: dict[str, object], source_file: Path, llm_conte
 
     # ── Introduction ──
     doc.add_heading("Introduction", level=1)
-    if llm_content and llm_content.get("introduction"):
+    if content and content.get("introduction"):
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.line_spacing = 1.5
         p.paragraph_format.space_after = Pt(6)
-        p.add_run(llm_content["introduction"])
+        p.add_run(content["introduction"])
     else:
         intro_guide = doc.add_paragraph()
         run = intro_guide.add_run(
@@ -1669,15 +1592,15 @@ def build_combined_docx(summary: dict[str, object], source_file: Path, llm_conte
     llm_sections = {}
     llm_tables = {}
     llm_figures = {}
-    if llm_content:
-        for sec in llm_content.get("sections", []):
+    if content:
+        for sec in content.get("sections", []):
             llm_sections[sec["title"]] = sec["body"]
-        for tbl in llm_content.get("tables", []):
+        for tbl in content.get("tables", []):
             llm_tables.setdefault(tbl["section"], []).append(tbl)
-        for fig in llm_content.get("figures", []):
+        for fig in content.get("figures", []):
             llm_figures.setdefault(fig["section"], []).append(fig)
 
-    figures_dir = source_file.parent / "figures" if llm_content else None
+    figures_dir = source_file.parent / "figures" if content else None
     if figures_dir:
         figures_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1712,7 +1635,7 @@ def build_combined_docx(summary: dict[str, object], source_file: Path, llm_conte
             fig_idx = 0
             for fig_data in llm_figures.get(section_title, []):
                 fig_idx += 1
-                fig_path = render_figure_from_data(fig_data, figures_dir, fig_idx)  # type: ignore[arg-type]
+                fig_path = _render_figure(fig_data, figures_dir, fig_idx)  # type: ignore[arg-type]
                 if fig_path and fig_path.exists():
                     doc.add_picture(str(fig_path), width=Inches(5.5))
                 add_caption_fn(doc, fig_data.get("caption", ""))
@@ -1796,12 +1719,12 @@ def build_combined_docx(summary: dict[str, object], source_file: Path, llm_conte
 
     # ── Conclusion ──
     doc.add_heading("Conclusion", level=1)
-    if llm_content and llm_content.get("conclusion"):
+    if content and content.get("conclusion"):
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.line_spacing = 1.5
         p.paragraph_format.space_after = Pt(6)
-        p.add_run(llm_content["conclusion"])
+        p.add_run(content["conclusion"])
     else:
         concl_guide = doc.add_paragraph()
         run = concl_guide.add_run(
@@ -1817,7 +1740,7 @@ def build_combined_docx(summary: dict[str, object], source_file: Path, llm_conte
     # ── Reference List ──
     doc.add_heading("Reference List", level=1)
 
-    llm_refs = llm_content.get("references", []) if llm_content else []
+    llm_refs = content.get("references", []) if content else []
     if llm_refs:
         for ref in llm_refs:
             p = doc.add_paragraph()
@@ -1961,7 +1884,7 @@ def build_output_summary_markdown(summary: dict[str, object], source_file: Path,
     return "\n".join(lines)
 
 
-def generate_for_brief(docx_path: Path, base_output_dir: Path, llm_config: Any = None) -> Path:
+def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
     if not docx_path.exists():
         raise FileNotFoundError(f"Brief file not found: {docx_path}")
 
@@ -1989,22 +1912,12 @@ def generate_for_brief(docx_path: Path, base_output_dir: Path, llm_config: Any =
         for file_path in target_dir.glob(pattern):
             file_path.unlink()
 
-    # Generate LLM content if configured
-    llm_content = None
-    if llm_config is not None:
-        try:
-            llm_content = _generate_full_content(summary, llm_config)
-            logger.info("LLM content generated for %s (%d sections, %d refs).",
-                        docx_path.name,
-                        len(llm_content.get("sections", [])),
-                        len(llm_content.get("references", [])))
-        except Exception:
-            logger.exception("LLM content generation failed; falling back to placeholder template.")
-            llm_content = None
+    # Generate template-based content (analysis, citations, tables, figures)
+    content = build_template_content(summary)
 
     # Build and save the single .docx
     docx_name = f"{docx_path.stem}_helper.docx"
-    doc = build_combined_docx(summary, docx_path, llm_content=llm_content)
+    doc = build_combined_docx(summary, docx_path, content=content)
     doc.save(str(target_dir / docx_name))
 
     # Build and save the single .md summary
@@ -2026,12 +1939,6 @@ def parse_args() -> argparse.Namespace:
         default="workflow_runs",
         help="Directory where generated artifact folders should be written.",
     )
-    parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Use LLM to generate actual analysis, citations, tables, and figures "
-             "(requires OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY env var).",
-    )
     return parser.parse_args()
 
 
@@ -2040,27 +1947,12 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     created_dirs: list[Path] = []
 
-    llm_config = None
-    if args.llm:
-        if LLMConfig is None:
-            logger.error("LLM modules not available. Install openai / anthropic packages.")
-            raise SystemExit(1)
-        llm_config = LLMConfig.from_env()
-        if llm_config is None:
-            logger.error(
-                "--llm flag set but no API key found. Set OPENROUTER_API_KEY, "
-                "OPENAI_API_KEY, or ANTHROPIC_API_KEY."
-            )
-            raise SystemExit(1)
-        logger.info("LLM enabled: provider=%s model=%s", llm_config.provider, llm_config.model)
-
     for brief in args.briefs:
         docx_path = Path(brief)
-        created_dirs.append(generate_for_brief(docx_path, output_dir, llm_config=llm_config))
+        created_dirs.append(generate_for_brief(docx_path, output_dir))
 
-    mode = "with LLM content" if llm_config else "with placeholder templates"
     for directory in created_dirs:
-        print(f"Generated assignment helper package in: {directory} ({mode})")
+        print(f"Generated assignment helper package in: {directory}")
 
 
 if __name__ == "__main__":
