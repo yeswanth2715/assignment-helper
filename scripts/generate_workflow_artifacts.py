@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 from docx import Document
 
@@ -12,6 +13,20 @@ try:
     import pdfplumber
 except ImportError:
     pdfplumber = None  # type: ignore[assignment]
+
+try:
+    from .content_generator import (
+        generate_conclusion,
+        generate_figure_data,
+        generate_introduction,
+        generate_references,
+        generate_section_content,
+        generate_table_data,
+    )
+    from .llm_client import LLMConfig
+except ImportError:
+    LLMConfig = None  # type: ignore[assignment]
+    generate_section_content = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -1412,7 +1427,161 @@ def _add_md_section_to_docx(doc: Document, md_text: str) -> None:
             doc._last_md_table = None  # type: ignore[attr-defined]
 
 
-def build_combined_docx(summary: dict[str, object], source_file: Path) -> Document:
+# ── LLM-based content generation ──
+
+
+def _generate_full_content(
+    summary: dict[str, Any],
+    config: LLMConfig,
+) -> dict[str, Any]:
+    """Generate complete assignment content via LLM for all sections."""
+    from .content_generator import (
+        generate_conclusion,
+        generate_figure_data,
+        generate_introduction,
+        generate_references,
+        generate_section_content,
+        generate_table_data,
+    )
+
+    logger.info("Generating content via LLM (%s / %s) ...", config.provider, config.model)
+
+    sections_content: list[dict[str, Any]] = []
+    all_references: list[dict[str, str]] = []
+    all_tables: list[dict[str, Any]] = []
+    all_figures: list[dict[str, Any]] = []
+
+    for sec in summary.get("task_sections", []):
+        title = sec.get("title", "")
+        desc = sec.get("description", "")
+        sub_tasks: list[str] = sec.get("sub_tasks", [])
+        logger.info("  Writing section: %s", title)
+        body = generate_section_content(title, desc, sub_tasks, summary, config)
+        sections_content.append({"title": title, "body": body})
+
+        # Generate a table for this section
+        table_data = generate_table_data(title, summary, config)
+        if table_data:
+            all_tables.append({"section": title, **table_data})
+
+        # Generate figure data (for ~half the sections)
+        if len(all_figures) < 3:
+            fig_data = generate_figure_data(title, summary, config)
+            if fig_data:
+                all_figures.append({"section": title, **fig_data})
+
+    logger.info("  Writing introduction ...")
+    intro = generate_introduction(summary, config)
+
+    logger.info("  Writing conclusion ...")
+    conclusion = generate_conclusion(summary, config)
+
+    logger.info("  Generating references ...")
+    refs = generate_references(summary, config)
+    if refs:
+        all_references = refs
+
+    return {
+        "introduction": intro,
+        "sections": sections_content,
+        "conclusion": conclusion,
+        "references": all_references,
+        "tables": all_tables,
+        "figures": all_figures,
+    }
+
+
+def render_figure_from_data(fig_data: dict[str, Any], figures_dir: Path, index: int) -> Path | None:
+    """Render a matplotlib figure from structured data."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    try:
+        fig_type = fig_data.get("type", "bar")
+        labels = fig_data.get("labels", [])
+        values = fig_data.get("values", [])
+        if not labels or not values:
+            return None
+
+        output = figures_dir / f"figure_{index}.png"
+
+        if fig_type == "horizontal_bar":
+            fig, ax = plt.subplots(figsize=(8.5, 4.8))
+            colors = ["#16324F", "#235789", "#C1292E", "#2E9A4A", "#D4A32A", "#7B4EA4"]
+            bars = ax.barh(labels, values, color=colors[:len(labels)], height=0.6)
+            ax.set_xlabel(fig_data.get("xlabel", ""), fontsize=10)
+            ax.set_title(fig_data.get("title", ""), fontsize=13, weight="bold")
+            ax.grid(axis="x", linestyle="--", alpha=0.35)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.invert_yaxis()
+            for bar, value in zip(bars, values):
+                ax.text(value + 0.15, bar.get_y() + bar.get_height() / 2, str(value), va="center", fontsize=10)
+        else:
+            fig, ax = plt.subplots(figsize=(8.5, 4.8))
+            colors = ["#16324F", "#235789", "#C1292E", "#2E9A4A", "#D4A32A", "#7B4EA4"]
+            bars = ax.bar(labels, values, color=colors[:len(labels)], width=0.6)
+            ax.set_ylabel(fig_data.get("ylabel", ""), fontsize=10)
+            ax.set_xlabel(fig_data.get("xlabel", ""), fontsize=10)
+            ax.set_title(fig_data.get("title", ""), fontsize=13, weight="bold")
+            ax.grid(axis="y", linestyle="--", alpha=0.35)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            for bar, value in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2, value + 0.3, str(value), ha="center", fontsize=10)
+
+        fig.tight_layout()
+        fig.savefig(output, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        return output
+    except Exception:
+        logger.warning("Failed to render figure", exc_info=True)
+        return None
+
+
+def add_caption_fn(doc: Document, text: str) -> None:
+    """Add a centred italic caption paragraph to a docx."""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(text)
+    run.italic = True
+    run.font.size = Pt(10)
+
+
+def _add_table_to_docx(doc: Document, headers: list[str], rows: list[list[str]]) -> None:
+    """Add a formatted table to a docx document."""
+    from docx.shared import Inches
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    if not headers or not rows:
+        return
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+        for paragraph in hdr[i].paragraphs:
+            for run in paragraph.runs:
+                run.font.name = "Times New Roman"
+                run.font.size = Pt(10)
+                run.bold = True
+    for row_data in rows:
+        cells = table.add_row().cells
+        for i, val in enumerate(row_data):
+            if i < len(cells):
+                cells[i].text = val
+                for paragraph in cells[i].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.name = "Times New Roman"
+                        run.font.size = Pt(10)
+                cells[i].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+
+def build_combined_docx(summary: dict[str, object], source_file: Path, llm_content: dict[str, Any] | None = None) -> Document:
     """Build a single Word document containing the actual assignment draft content."""
     from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1480,16 +1649,38 @@ def build_combined_docx(summary: dict[str, object], source_file: Path) -> Docume
 
     # ── Introduction ──
     doc.add_heading("Introduction", level=1)
-    intro_guide = doc.add_paragraph()
-    run = intro_guide.add_run(
-        "[Frame the assignment topic, define the scope, state the research problem/questions, "
-        "and outline the structure of the paper. Include at least one verified citation to establish context.]"
-    )
-    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-    run.font.size = Pt(11)
+    if llm_content and llm_content.get("introduction"):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.line_spacing = 1.5
+        p.paragraph_format.space_after = Pt(6)
+        p.add_run(llm_content["introduction"])
+    else:
+        intro_guide = doc.add_paragraph()
+        run = intro_guide.add_run(
+            "[Frame the assignment topic, define the scope, state the research problem/questions, "
+            "and outline the structure of the paper. Include at least one verified citation to establish context.]"
+        )
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        run.font.size = Pt(11)
     doc.add_paragraph("")
 
     # ── Each detected section as a real draft section ──
+    llm_sections = {}
+    llm_tables = {}
+    llm_figures = {}
+    if llm_content:
+        for sec in llm_content.get("sections", []):
+            llm_sections[sec["title"]] = sec["body"]
+        for tbl in llm_content.get("tables", []):
+            llm_tables.setdefault(tbl["section"], []).append(tbl)
+        for fig in llm_content.get("figures", []):
+            llm_figures.setdefault(fig["section"], []).append(fig)
+
+    figures_dir = source_file.parent / "figures" if llm_content else None
+    if figures_dir:
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
     for section in task_sections:  # type: ignore[union-attr]
         section_title = str(section.get("title", "Untitled"))  # type: ignore[union-attr]
         section_desc = str(section.get("description", ""))  # type: ignore[union-attr]
@@ -1501,6 +1692,34 @@ def build_combined_docx(summary: dict[str, object], source_file: Path) -> Docume
 
         doc.add_heading(section_title, level=1)
 
+        # ── LLM-generated body ──
+        llm_body = llm_sections.get(section_title)
+        if llm_body:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.line_spacing = 1.5
+            p.paragraph_format.space_after = Pt(6)
+            p.add_run(llm_body)
+            doc.add_paragraph("")
+
+            # Insert LLM-generated tables for this section
+            for tbl_data in llm_tables.get(section_title, []):
+                add_caption_fn(doc, tbl_data.get("caption", ""))
+                _add_table_to_docx(doc, tbl_data.get("headers", []), tbl_data.get("rows", []))
+                doc.add_paragraph("")
+
+            # Insert LLM-generated figures
+            fig_idx = 0
+            for fig_data in llm_figures.get(section_title, []):
+                fig_idx += 1
+                fig_path = render_figure_from_data(fig_data, figures_dir, fig_idx)  # type: ignore[arg-type]
+                if fig_path and fig_path.exists():
+                    doc.add_picture(str(fig_path), width=Inches(5.5))
+                add_caption_fn(doc, fig_data.get("caption", ""))
+                doc.add_paragraph("")
+            continue
+
+        # ── Fallback: placeholder guidance (no LLM) ──
         # Brief requirement as guidance note
         if section_desc:
             guide_para = doc.add_paragraph()
@@ -1577,41 +1796,63 @@ def build_combined_docx(summary: dict[str, object], source_file: Path) -> Docume
 
     # ── Conclusion ──
     doc.add_heading("Conclusion", level=1)
-    concl_guide = doc.add_paragraph()
-    run = concl_guide.add_run(
-        "[Summarise the key findings, highlight the contribution of the study, "
-        "and suggest future research directions. Do not introduce new material here.]"
-    )
-    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-    run.font.size = Pt(11)
+    if llm_content and llm_content.get("conclusion"):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.line_spacing = 1.5
+        p.paragraph_format.space_after = Pt(6)
+        p.add_run(llm_content["conclusion"])
+    else:
+        concl_guide = doc.add_paragraph()
+        run = concl_guide.add_run(
+            "[Summarise the key findings, highlight the contribution of the study, "
+            "and suggest future research directions. Do not introduce new material here.]"
+        )
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        run.font.size = Pt(11)
     doc.add_paragraph("")
 
     doc.add_page_break()
 
     # ── Reference List ──
     doc.add_heading("Reference List", level=1)
-    ref_guide = doc.add_paragraph()
-    run = ref_guide.add_run("Harvard Referencing Format — add only sources you actually used and verified.")
-    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-    run.italic = True
-    doc.add_paragraph("")
 
-    # Add reference format examples
-    ref_templates = [
-        ("Journal Article", "Author, A.A. and Author, B.B. (Year) 'Article title', Journal Title, volume(issue), pp. xx-xx."),
-        ("Book", "Author, A.A. (Year) Book Title. Place of publication: Publisher."),
-        ("Book Chapter", "Author, A.A. (Year) 'Chapter title', in Editor, E.E. (ed.) Book Title. Publisher, pp. xx-xx."),
-        ("Web / Report", "Organisation (Year) Title. Available at: URL (Accessed: Date)."),
-    ]
-    for ref_type, template in ref_templates:
-        p = doc.add_paragraph()
-        run = p.add_run(f"[{ref_type}]: ")
-        run.bold = True
-        run.font.size = Pt(10)
-        run = p.add_run(template)
-        run.font.name = "Courier New"
-        run.font.size = Pt(9)
+    llm_refs = llm_content.get("references", []) if llm_content else []
+    if llm_refs:
+        for ref in llm_refs:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            run = p.add_run(ref.get("citation", ""))
+            run.font.size = Pt(11)
+            note = ref.get("relevance", "")
+            if note:
+                run2 = p.add_run(f"  [{note}]")
+                run2.font.size = Pt(9)
+                run2.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+                run2.italic = True
+    else:
+        ref_guide = doc.add_paragraph()
+        run = ref_guide.add_run("Harvard Referencing Format — add only sources you actually used and verified.")
         run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        run.italic = True
+        doc.add_paragraph("")
+
+        # Add reference format examples
+        ref_templates = [
+            ("Journal Article", "Author, A.A. and Author, B.B. (Year) 'Article title', Journal Title, volume(issue), pp. xx-xx."),
+            ("Book", "Author, A.A. (Year) Book Title. Place of publication: Publisher."),
+            ("Book Chapter", "Author, A.A. (Year) 'Chapter title', in Editor, E.E. (ed.) Book Title. Publisher, pp. xx-xx."),
+            ("Web / Report", "Organisation (Year) Title. Available at: URL (Accessed: Date)."),
+        ]
+        for ref_type, template in ref_templates:
+            ref_p = doc.add_paragraph()
+            run = ref_p.add_run(f"[{ref_type}]: ")
+            run.bold = True
+            run.font.size = Pt(10)
+            run = ref_p.add_run(template)
+            run.font.name = "Courier New"
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     doc.add_paragraph("")
     doc.add_page_break()
@@ -1720,7 +1961,7 @@ def build_output_summary_markdown(summary: dict[str, object], source_file: Path,
     return "\n".join(lines)
 
 
-def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
+def generate_for_brief(docx_path: Path, base_output_dir: Path, llm_config: Any = None) -> Path:
     if not docx_path.exists():
         raise FileNotFoundError(f"Brief file not found: {docx_path}")
 
@@ -1748,9 +1989,22 @@ def generate_for_brief(docx_path: Path, base_output_dir: Path) -> Path:
         for file_path in target_dir.glob(pattern):
             file_path.unlink()
 
+    # Generate LLM content if configured
+    llm_content = None
+    if llm_config is not None:
+        try:
+            llm_content = _generate_full_content(summary, llm_config)
+            logger.info("LLM content generated for %s (%d sections, %d refs).",
+                        docx_path.name,
+                        len(llm_content.get("sections", [])),
+                        len(llm_content.get("references", [])))
+        except Exception:
+            logger.exception("LLM content generation failed; falling back to placeholder template.")
+            llm_content = None
+
     # Build and save the single .docx
     docx_name = f"{docx_path.stem}_helper.docx"
-    doc = build_combined_docx(summary, docx_path)
+    doc = build_combined_docx(summary, docx_path, llm_content=llm_content)
     doc.save(str(target_dir / docx_name))
 
     # Build and save the single .md summary
@@ -1772,6 +2026,12 @@ def parse_args() -> argparse.Namespace:
         default="workflow_runs",
         help="Directory where generated artifact folders should be written.",
     )
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Use LLM to generate actual analysis, citations, tables, and figures "
+             "(requires OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY env var).",
+    )
     return parser.parse_args()
 
 
@@ -1780,12 +2040,27 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     created_dirs: list[Path] = []
 
+    llm_config = None
+    if args.llm:
+        if LLMConfig is None:
+            logger.error("LLM modules not available. Install openai / anthropic packages.")
+            raise SystemExit(1)
+        llm_config = LLMConfig.from_env()
+        if llm_config is None:
+            logger.error(
+                "--llm flag set but no API key found. Set OPENROUTER_API_KEY, "
+                "OPENAI_API_KEY, or ANTHROPIC_API_KEY."
+            )
+            raise SystemExit(1)
+        logger.info("LLM enabled: provider=%s model=%s", llm_config.provider, llm_config.model)
+
     for brief in args.briefs:
         docx_path = Path(brief)
-        created_dirs.append(generate_for_brief(docx_path, output_dir))
+        created_dirs.append(generate_for_brief(docx_path, output_dir, llm_config=llm_config))
 
+    mode = "with LLM content" if llm_config else "with placeholder templates"
     for directory in created_dirs:
-        print(f"Generated workflow artifacts in: {directory}")
+        print(f"Generated assignment helper package in: {directory} ({mode})")
 
 
 if __name__ == "__main__":
