@@ -233,10 +233,12 @@ def extract_part_sections(assignment_text: str) -> list[dict[str, str]]:
         title, body = split_section_title_and_body(block)
         clean_title = clean_text(title)
         clean_body = trim_section_body(body)
+        sub_tasks = extract_sub_tasks(clean_body)
         sections.append(
             {
                 "title": clean_title,
                 "description": shorten(clean_body),
+                "sub_tasks": sub_tasks,
                 "expected_output": infer_expected_output(clean_title),
             }
         )
@@ -256,10 +258,13 @@ def extract_named_sections(assignment_text: str, headings: list[str]) -> list[di
     for index, (start, heading) in enumerate(markers):
         end = markers[index + 1][0] if index + 1 < len(markers) else len(assignment_text)
         body = assignment_text[start + len(heading) : end]
+        clean_body = trim_section_body(body)
+        sub_tasks = extract_sub_tasks(clean_body)
         sections.append(
             {
                 "title": heading,
-                "description": shorten(trim_section_body(body)),
+                "description": shorten(clean_body),
+                "sub_tasks": sub_tasks,
                 "expected_output": infer_expected_output(heading),
             }
         )
@@ -282,10 +287,12 @@ def extract_numbered_question_sections(assignment_text: str) -> list[dict[str, s
         end = matches[index + 1].start() if index + 1 < len(matches) else len(assignment_text)
         title = clean_text(match.group(2))
         body = trim_section_body(assignment_text[match.end() : end])
+        sub_tasks = extract_sub_tasks(body)
         sections.append(
             {
                 "title": title,
                 "description": shorten(body),
+                "sub_tasks": sub_tasks,
                 "expected_output": infer_expected_output(title),
             }
         )
@@ -335,10 +342,12 @@ def extract_research_paper_sections(text: str) -> list[dict[str, str]]:
         if wc_match:
             wc_hint = f" [{wc_match.group(1)}]"
 
+        sub_tasks = extract_sub_tasks(body)
         sections.append(
             {
                 "title": title.strip(),
                 "description": shorten(body) + wc_hint,
+                "sub_tasks": sub_tasks,
                 "expected_output": infer_expected_output(title),
             }
         )
@@ -387,6 +396,62 @@ def extract_task_sections(assignment_text: str) -> list[dict[str, str]]:
             "expected_output": "A complete response aligned to the brief and rubric.",
         }
     ]
+
+
+def extract_sub_tasks(description: str) -> list[str]:
+    """Split a section description into discrete sub-task statements.
+
+    Detects boundaries at:
+    - Sentence breaks (period + capital letter)
+    - Action-verb transitions without a period
+    - 'and finally', 'then', or comma-separated action phrases.
+    """
+    if not description or len(description) < 30:
+        return []
+
+    action_verbs = (
+        r'(?:(?:You\s+)?(?:should\s+)?'
+        r'(?:Map|Choose|Select|Identify|Evaluate|Develop|Reflect|Construct|Apply|'
+        r'Critically\s+evaluate|Analyze|Assess|Propose|Recommend|Compare|Discuss|'
+        r'Write|Explain|Create|Consider|Examine|Investigate|Describe|Summarize|'
+        r'Outline|Define|Illustrate|Contrast|Justify|Argue|Synthesize))'
+    )
+
+    # Split on: sentence boundaries, ') Verb', ', and finally Verb', ', then Verb'
+    # No global re.IGNORECASE: [A-Z] in the sentence-boundary branch stays
+    # case-sensitive (avoids false splits like "vs. global").  Use inline
+    # (?i) so action_verb matching is case-insensitive.
+    parts = re.split(
+        r'(?:'
+        r'(?<=\.)\s+(?=[A-Z][a-z])'
+        r'|(?i:(?<=\))\s+(?=' + action_verbs + r'))'
+        r'|(?i:,\s+(?:and\s+)?finally\s+(?=' + action_verbs + r'))'
+        r'|(?i:,\s+then\s+(?=' + action_verbs + r'))'
+        r')',
+        description,
+    )
+
+    tasks: list[str] = []
+    for part in parts:
+        part = part.strip().strip(",;.")
+        if part and len(part) > 10:
+            # Re-attach leading lowercase verb swallowed by the split
+            lowered = part.lower()
+            leading_verbs = (
+                "map ", "choose ", "select ", "identify ", "evaluate ",
+                "develop ", "reflect ", "construct ", "apply ", "critically evaluate ",
+                "analyze ", "assess ", "propose ", "recommend ", "compare ", "discuss ",
+            )
+            for v in leading_verbs:
+                if lowered.startswith(v):
+                    part = part[0].upper() + part[1:]
+                    break
+            tasks.append(part)
+
+    # If splitting found nothing useful, return empty list
+    if len(tasks) < 2:
+        return []
+    return tasks
 
 
 def extract_weighted_criteria(tables: list[list[list[str]]]) -> list[dict[str, str]]:
@@ -767,13 +832,35 @@ def build_assignment_scaffold(summary: dict[str, object]) -> str:
     lines.extend(["## Introduction", "", "- Frame the assignment, scope, and central argument.", ""])
 
     for section in summary["task_sections"]:
+        lines.extend([f"## {section['title']}", ""])
+
+        sub_tasks: list[str] = section.get("sub_tasks", [])  # type: ignore[assignment]
+        if sub_tasks:
+            for i, task in enumerate(sub_tasks, 1):
+                heading = task.strip()
+                if heading and heading[0].islower():
+                    heading = heading[0].upper() + heading[1:]
+                lines.extend(
+                    [
+                        f"### {i}. {heading}",
+                        "",
+                        f"- Required focus: {task}",
+                        "- Theory to integrate:",
+                        "- Evidence to cite:",
+                        "",
+                    ]
+                )
+        else:
+            lines.extend(
+                [
+                    f"- Required focus: {section['description']}",
+                    "- Theory to integrate:",
+                    "- Evidence to cite:",
+                ]
+            )
+
         lines.extend(
             [
-                f"## {section['title']}",
-                "",
-                f"- Required focus: {section['description']}",
-                "- Theory to integrate:",
-                "- Evidence to cite:",
                 f"- Suggested artifact: {recommend_artifact(section['title'])}",
                 "",
             ]
@@ -900,12 +987,35 @@ def build_draft_starter(summary: dict[str, object]) -> str:
     lines.extend(["## Introduction", "", "- [Frame the brief, scope, and argument. Add at least one verified citation.]", ""])
 
     for section in summary["task_sections"]:
+        lines.extend([f"## {section['title']}", ""])
+
+        sub_tasks: list[str] = section.get("sub_tasks", [])  # type: ignore[assignment]
+
+        if sub_tasks:
+            lines.append(f"**Brief requirement:** {section['description']}")
+            lines.append("")
+            for i, task in enumerate(sub_tasks, 1):
+                heading = task.strip()
+                if heading and heading[0].islower():
+                    heading = heading[0].upper() + heading[1:]
+                lines.extend(
+                    [
+                        f"### {i}. {heading}",
+                        "",
+                        "- [Answer this sub-task directly. Apply theory, cite evidence, and state your judgement.]",
+                        "",
+                    ]
+                )
+        else:
+            lines.extend(
+                [
+                    f"**Brief requirement:** {section['description']}",
+                    "",
+                ]
+            )
+
         lines.extend(
             [
-                f"## {section['title']}",
-                "",
-                f"**Brief requirement:** {section['description']}",
-                "",
                 "**Section judgement:**",
                 "",
                 "- [State the main claim you will defend in this section.]",
@@ -1399,6 +1509,20 @@ def build_combined_docx(summary: dict[str, object], source_file: Path) -> Docume
             run.font.size = Pt(10)
             run.italic = True
             doc.add_paragraph("")
+
+        # Sub-task headings (when detected)
+        sub_tasks_raw = section.get("sub_tasks", [])  # type: ignore[union-attr]
+        if sub_tasks_raw:
+            for idx, task in enumerate(sub_tasks_raw, 1):  # type: ignore[union-attr]
+                heading = task.strip()
+                if heading and heading[0].islower():
+                    heading = heading[0].upper() + heading[1:]
+                doc.add_heading(f"{idx}. {heading}", level=2)
+                note = doc.add_paragraph()
+                run = note.add_run("[Answer this sub-task directly. Apply theory, cite evidence, and state your judgement.]")
+                run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+                run.font.size = Pt(10)
+                doc.add_paragraph("")
 
         # Theory / framework placeholder
         theory_head = doc.add_paragraph()
