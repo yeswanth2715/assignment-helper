@@ -54,6 +54,6 @@ python-docx    pdfplumber    matplotlib    Pillow
 
 ---
 
-## Ethical Use
+## Important
 
-The tool produces draft text. You must **rewrite it in your own words**, verify all citations against real sources, and check for originality before submission. Unmodified AI-generated text may violate academic integrity policies.
+This tool **helps produce a structured draft** — it is **not** a final submission, **not** a grade guarantee, and **not** a replacement for your own judgement. You must critically evaluate everything, rewrite the language in your own voice, and verify every source before submitting. Unmodified output may violate academic integrity policies. Use responsibly and take a license in future to avoid any problems.
